@@ -439,7 +439,6 @@ func main() {
 		}
 		go webhook.run()
 	}
-
 	initialSync := true
 	failCount := 0
 	for {
@@ -630,13 +629,14 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	// NOTE: this works for repo with or without submodules.
 	if submoduleMode != submodulesOff {
 		log.V(0).Info("updating submodules")
-		submodulesArgs := []string{"submodule", "update", "--init"}
+		submodulesArgs := []string{"submodule", "update", "--init", "--remote"}
 		if submoduleMode == submodulesRecursive {
 			submodulesArgs = append(submodulesArgs, "--recursive")
 		}
 		if depth != 0 {
 			submodulesArgs = append(submodulesArgs, "--depth", strconv.Itoa(depth))
 		}
+
 		_, err = runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...)
 		if err != nil {
 			return err
@@ -665,6 +665,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 		if err := os.RemoveAll(oldWorktree); err != nil {
 			return fmt.Errorf("error removing directory: %v", err)
 		}
+		
 		if _, err := runCommand(ctx, gitRoot, *flGitCmd, "worktree", "prune"); err != nil {
 			return err
 		}
