@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,12 +56,15 @@ var flDepth = flag.Int("depth", envInt("GIT_SYNC_DEPTH", 0),
 	"use a shallow clone with a history truncated to the specified number of commits")
 var flSubmodules = flag.String("submodules", envString("GIT_SYNC_SUBMODULES", "recursive"),
 	"git submodule behavior: one of 'recursive', 'shallow', or 'off'")
+var flSubmodulesRemoteTracking = flag.String("submodules-remote-tracking",
+	envString("GIT_SYNC_SUBMODULES_REMOTE_TRACKING", ""),
+	"the comma separated submodule's name list to enable remote-tracking branch sync, eg. 'module1,module2', see: 'man gitmodules' and find 'submodule.<name>.branch' for detail")
 
 var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", envString("HOME", "")+"/git"),
 	"the root directory for git-sync operations, under which --dest will be created")
 var flDest = flag.String("dest", envString("GIT_SYNC_DEST", ""),
 	"the name of (a symlink to) a directory in which to check-out files under --root (defaults to the leaf dir of --repo)")
-var flWait = flag.Float64("wait", envFloat("GIT_SYNC_WAIT", 1),
+var flWait = flag.Float64("wait", envFloat("GIT_SYNC_WAIT", 0),
 	"the number of seconds between syncs")
 var flSyncTimeout = flag.Int("timeout", envInt("GIT_SYNC_TIMEOUT", 120),
 	"the max number of seconds allowed for a complete sync")
@@ -70,9 +74,6 @@ var flMaxSyncFailures = flag.Int("max-sync-failures", envInt("GIT_SYNC_MAX_SYNC_
 	"the number of consecutive failures allowed before aborting (the first sync must succeed, -1 will retry forever after the initial sync)")
 var flChmod = flag.Int("change-permissions", envInt("GIT_SYNC_PERMISSIONS", 0),
 	"the file permissions to apply to the checked-out files (0 will not change permissions at all)")
-var flSyncHookCommand = flag.String("sync-hook-command", envString("GIT_SYNC_HOOK_COMMAND", ""),
-	"the command executed with the syncing repository as its working directory after syncing a new hash of the remote repository. "+
-		"it is subject to the sync time out and will extend period between syncs. (doesn't support the command arguments)")
 
 var flWebhookURL = flag.String("webhook-url", envString("GIT_SYNC_WEBHOOK_URL", ""),
 	"the URL for a webook notification when syncs complete (default is no webook)")
@@ -153,6 +154,12 @@ const (
 	submodulesOff       = "off"
 )
 
+type submoduleOptions struct {
+	submoduleMode                  string
+	submoduleRemoteTrackingNames   []string
+	submoduleRemoteTrackingEnabled bool
+}
+
 func init() {
 	prometheus.MustRegister(syncDuration)
 	prometheus.MustRegister(syncCount)
@@ -224,6 +231,26 @@ func setFlagDefaults() {
 	stderrFlag.Value.Set("true")
 }
 
+func parseSubmodulesOptions(submoduleMode, submodulesRemoteTracking string) *submoduleOptions {
+	options := &submoduleOptions{
+		submoduleMode:                  submoduleMode,
+		submoduleRemoteTrackingNames:   []string{},
+		submoduleRemoteTrackingEnabled: false,
+	}
+
+	if submoduleMode == submodulesOff || submodulesRemoteTracking == "" {
+		return options
+	}
+
+	splitFn := func(c rune) bool {
+		return c == ','
+	}
+	options.submoduleRemoteTrackingNames = strings.FieldsFunc(submodulesRemoteTracking, splitFn)
+	options.submoduleRemoteTrackingEnabled = len(options.submoduleRemoteTrackingNames) > 0
+
+	return options
+}
+
 func main() {
 	// In case we come up as pid 1, act as init.
 	if os.Getpid() == 1 {
@@ -259,8 +286,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	var submoduleOpts *submoduleOptions
 	switch *flSubmodules {
 	case submodulesRecursive, submodulesShallow, submodulesOff:
+		submoduleOpts = parseSubmodulesOptions(*flSubmodules, *flSubmodulesRemoteTracking)
 	default:
 		fmt.Fprintf(os.Stderr, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
 		flag.Usage()
@@ -297,8 +326,8 @@ func main() {
 	}
 
 	if *flWebhookURL != "" {
-		if *flWebhookStatusSuccess < -1 {
-			fmt.Fprintf(os.Stderr, "ERROR: --webhook-success-status must be a valid HTTP code or -1\n")
+		if *flWebhookStatusSuccess <= 0 {
+			fmt.Fprintf(os.Stderr, "ERROR: --webhook-success-status must be greater than 0\n")
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -448,7 +477,7 @@ func main() {
 	for {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
-		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, *flSubmodules); err != nil {
+		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, submoduleOpts); err != nil {
 			updateSyncMetrics(metricKeyError, start)
 			if *flMaxSyncFailures != -1 && failCount >= *flMaxSyncFailures {
 				// Exit after too many retries, maybe the error is not recoverable.
@@ -582,7 +611,7 @@ func setRepoReady() {
 }
 
 // addWorktreeAndSwap creates a new worktree and calls updateSymlink to swap the symlink to point to the new worktree
-func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string) error {
+func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, depth int, hash string, submoduleOpts *submoduleOptions) error {
 	log.V(0).Info("syncing git", "rev", rev, "hash", hash)
 
 	args := []string{"fetch", "-f", "--tags"}
@@ -631,17 +660,8 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 
 	// Update submodules
 	// NOTE: this works for repo with or without submodules.
-	if submoduleMode != submodulesOff {
-		log.V(0).Info("updating submodules")
-		submodulesArgs := []string{"submodule", "update", "--init"}
-		if submoduleMode == submodulesRecursive {
-			submodulesArgs = append(submodulesArgs, "--recursive")
-		}
-		if depth != 0 {
-			submodulesArgs = append(submodulesArgs, "--depth", strconv.Itoa(depth))
-		}
-		_, err = runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...)
-		if err != nil {
+	if submoduleOpts.submoduleMode != submodulesOff {
+		if err := updateSubmodules(ctx, worktreePath, depth, submoduleOpts); err != nil {
 			return err
 		}
 	}
@@ -651,15 +671,6 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 		mode := fmt.Sprintf("%#o", *flChmod)
 		log.V(0).Info("changing file permissions", "mode", mode)
 		_, err = runCommand(ctx, "", "chmod", "-R", mode, worktreePath)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Execute the command, if requested.
-	if *flSyncHookCommand != "" {
-		log.V(0).Info("executing command for git sync hooks", "command", *flSyncHookCommand)
-		_, err = runCommand(ctx, worktreePath, *flSyncHookCommand)
 		if err != nil {
 			return err
 		}
@@ -683,6 +694,206 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	}
 
 	return nil
+}
+
+func updateSubmodules(ctx context.Context, worktreePath string, depth int, submoduleOpts *submoduleOptions) error {
+	log.V(0).Info("updating submodules")
+
+	updateArgs := submoduleUpdateArgs(depth, submoduleOpts)
+	submodulesArgs := append([]string{"submodule", "update", "--init"}, updateArgs...)
+
+	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...); err != nil {
+		return err
+	}
+
+	// Update submodules with remote tracking enabled
+	if submoduleOpts.submoduleRemoteTrackingEnabled {
+		return updateSubmodulesWithRemoteTracking(ctx, worktreePath, submoduleOpts, updateArgs)
+	}
+
+	return nil
+}
+
+func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions, updateArgs []string) error {
+	submodulePaths, err := getSubmoduleWithRemoteTrackingPaths(ctx, worktreePath, submoduleOpts)
+	if err != nil {
+		return err
+	}
+
+	for _, submodulePath := range submodulePaths {
+		uptodate, err := submoduleIsUpToDate(ctx, worktreePath, submodulePath)
+		if err != nil {
+			return err
+		}
+
+		submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+		if err != nil {
+			return err
+		}
+
+		if uptodate {
+			log.V(1).Info("submodule is up to date", "submoduleName", submoduleName, "submodulePath", submodulePath)
+			continue
+		}
+
+		log.V(0).Info("updating submodule with remote tracking", "submoduleName", submoduleName, "submodulePath", submodulePath)
+		submoduleRemoteUpdateArgs := append([]string{"submodule", "update", "--remote"}, updateArgs...)
+		submoduleRemoteUpdateArgs = append(submoduleRemoteUpdateArgs, submodulePath)
+
+		if _, err = runCommand(ctx, worktreePath, *flGitCmd, submoduleRemoteUpdateArgs...); err != nil {
+			return err
+		}
+
+		updatedLocalHash, err := submoduleLocalHashForRev(ctx, worktreePath, submodulePath, "HEAD")
+		if err != nil {
+			return err
+		}
+
+		log.V(0).Info("submodule with remote tracking is updated", "submoduleName", submoduleName, "submodulePath", submodulePath, "hash", updatedLocalHash)
+	}
+
+	return nil
+}
+
+func submoduleUpdateArgs(depth int, submoduleOpts *submoduleOptions) (args []string) {
+	if submoduleOpts.submoduleMode == submodulesRecursive {
+		args = append(args, "--recursive")
+	}
+	if depth != 0 {
+		args = append(args, "--depth", strconv.Itoa(depth))
+	}
+
+	return
+}
+
+func submoduleIsUpToDate(ctx context.Context, worktreePath, submodulePath string) (bool, error) {
+	localHash, err := submoduleLocalHashForRev(ctx, worktreePath, submodulePath, "HEAD")
+	if err != nil {
+		return false, err
+	}
+
+	submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+	if err != nil {
+		return false, nil
+	}
+
+	branchRef, err := submoduleBranchRef(ctx, worktreePath, submoduleName)
+	if err != nil {
+		return false, err
+	}
+
+	remoteHash, err := submoduleRemoteHashForRef(ctx, worktreePath, submodulePath, branchRef)
+	if err != nil {
+		return false, err
+	}
+
+	log.V(5).Info("submodule", "submoduleName", submoduleName, "localHash", localHash, "remoteHash", remoteHash, "ref", branchRef)
+	if localHash == remoteHash {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func submoduleLocalHashForRev(ctx context.Context, worktreePath, submodulePath, rev string) (string, error) {
+	submoduleWorktreePath := filepath.Join(worktreePath, submodulePath)
+	output, err := runCommand(ctx, submoduleWorktreePath, *flGitCmd, "rev-parse", rev)
+	if err != nil {
+		return "", err
+	}
+
+	localHash := strings.Trim(string(output), "\n")
+	return localHash, nil
+}
+
+func submoduleRemoteHashForRef(ctx context.Context, worktreePath, submodulePath, ref string) (string, error) {
+	submoduleWorktreePath := filepath.Join(worktreePath, submodulePath)
+	output, err := runCommand(ctx, submoduleWorktreePath, *flGitCmd, "ls-remote", "--quiet", "origin", ref)
+	if err != nil {
+		return "", err
+	}
+
+	parts := strings.Split(string(output), "\t")
+	remoteHash := parts[0]
+
+	return remoteHash, nil
+}
+
+func submoduleNameFromPath(ctx context.Context, worktreePath, submodulePath string) (string, error) {
+	submoduleNameArgs := []string{"config", "--file", ".gitmodules", "--get-regexp", ".path$"}
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, submoduleNameArgs...)
+	if err != nil {
+		return "", err
+	}
+
+	splitFn := func(c rune) bool {
+		return c == '\n'
+	}
+
+	configPaths := strings.FieldsFunc(string(output), splitFn)
+	for _, configPath := range configPaths {
+		log.V(5).Info("looking up submodule name", "configPath", configPath, "submodulePath", submodulePath)
+		parts := strings.Split(configPath, " ")
+		if len(parts) == 2 && parts[1] == submodulePath {
+			re := regexp.MustCompile(`submodule\.(?P<name>.*)\.path`)
+			res := re.FindStringSubmatch(parts[0])
+
+			for i, key := range re.SubexpNames() {
+				if key == "name" {
+					log.V(5).Info("found submodule", "submoduleName", res[i])
+					return res[i], nil
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string) (string, error) {
+	confGitModulesArgs := []string{"config", "--file", ".gitmodules", "--default", "", "--get"}
+	confGitModulesArgs = append(confGitModulesArgs, "submodule."+submoduleName+".branch")
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, confGitModulesArgs...)
+	if err != nil {
+		return "", err
+	}
+
+	branch := strings.Trim(string(output), "\n")
+	if branch != "" {
+		return "refs/heads/" + branch, nil
+	}
+
+	return "HEAD", nil
+}
+
+func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions) ([]string, error) {
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, "submodule", "--quiet", "foreach", "pwd")
+	if err != nil {
+		return []string{}, err
+	}
+
+	splitFn := func(c rune) bool {
+		return c == '\n'
+	}
+
+	trimWorktreePath := strings.ReplaceAll(output, worktreePath+"/", "")
+	submodulePaths := strings.FieldsFunc(trimWorktreePath, splitFn)
+
+	list := []string{}
+	for _, submodulePath := range submodulePaths {
+		for _, submoduleRemoteTrackingName := range submoduleOpts.submoduleRemoteTrackingNames {
+			submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+			if err != nil {
+				return []string{}, err
+			}
+
+			if submoduleRemoteTrackingName == submoduleName {
+				list = append(list, submodulePath)
+			}
+		}
+	}
+
+	return list, nil
 }
 
 func cloneRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot string) error {
@@ -757,7 +968,7 @@ func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
 // returns (1) whether a change occured, (2) the new hash, and (3) an error if one happened
-func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleMode string) (bool, string, error) {
+func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleOpts *submoduleOptions) (bool, string, error) {
 	if authURL != "" {
 		// For ASKPASS Callback URL, the credentials behind is dynamic, it needs to be
 		// re-fetched each time.
@@ -793,13 +1004,22 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		}
 		if local == remote {
 			log.V(1).Info("no update required", "rev", rev, "local", local, "remote", remote)
+
+			// update submodules if remote tracking is set
+			if submoduleOpts.submoduleRemoteTrackingEnabled {
+				worktreePath := filepath.Join(gitRoot, "rev-"+local)
+				updateArgs := submoduleUpdateArgs(depth, submoduleOpts)
+
+				return false, "", updateSubmodulesWithRemoteTracking(ctx, worktreePath, submoduleOpts, updateArgs)
+			}
+
 			return false, "", nil
 		}
 		log.V(0).Info("update required", "rev", rev, "local", local, "remote", remote)
 		hash = remote
 	}
 
-	return true, hash, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, depth, hash, submoduleMode)
+	return true, hash, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, depth, hash, submoduleOpts)
 }
 
 // getRevs returns the local and upstream hashes for rev.
