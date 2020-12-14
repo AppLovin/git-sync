@@ -246,7 +246,9 @@ func parseSubmodulesOptions(submoduleMode, submodulesRemoteTracking string) *sub
 		return c == ','
 	}
 	options.submoduleRemoteTrackingNames = strings.FieldsFunc(submodulesRemoteTracking, splitFn)
+
 	options.submoduleRemoteTrackingEnabled = len(options.submoduleRemoteTrackingNames) > 0
+
 
 	return options
 }
@@ -661,6 +663,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	// Update submodules
 	// NOTE: this works for repo with or without submodules.
 	if submoduleOpts.submoduleMode != submodulesOff {
+
 		if err := updateSubmodules(ctx, worktreePath, depth, submoduleOpts); err != nil {
 			return err
 		}
@@ -700,9 +703,15 @@ func updateSubmodules(ctx context.Context, worktreePath string, depth int, submo
 	log.V(0).Info("updating submodules")
 
 	updateArgs := submoduleUpdateArgs(depth, submoduleOpts)
-	submodulesArgs := append([]string{"submodule", "update", "--init"}, updateArgs...)
+	submodulesInitArgs := append([]string{"submodule", "init"})
+	submodulesUpdateArgs := append([]string{"submodule", "update"})
 
-	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...); err != nil {
+	// Run submodule init
+	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesInitArgs...); err != nil {
+		return err
+	}
+	// Run submodule update
+	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesUpdateArgs...); err != nil {
 		return err
 	}
 
@@ -719,13 +728,12 @@ func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string
 	if err != nil {
 		return err
 	}
-
 	for _, submodulePath := range submodulePaths {
+
 		uptodate, err := submoduleIsUpToDate(ctx, worktreePath, submodulePath)
 		if err != nil {
 			return err
 		}
-
 		submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
 		if err != nil {
 			return err
@@ -759,6 +767,7 @@ func submoduleUpdateArgs(depth int, submoduleOpts *submoduleOptions) (args []str
 	if submoduleOpts.submoduleMode == submodulesRecursive {
 		args = append(args, "--recursive")
 	}
+
 	if depth != 0 {
 		args = append(args, "--depth", strconv.Itoa(depth))
 	}
@@ -866,6 +875,17 @@ func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string)
 	return "HEAD", nil
 }
 
+func removeQuotes(s string) string {
+	if len(s) > 0 && s[0] == '\'' {
+	    s = s[1:]
+	}
+	if len(s) > 0 && s[len(s)-1] == '\'' {
+	    s = s[:len(s)-1]
+	}
+	log.V(0).Info("returning trimmed string", s)
+	return s
+}
+
 func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions) ([]string, error) {
 	output, err := runCommand(ctx, worktreePath, *flGitCmd, "submodule", "--quiet", "foreach", "pwd")
 	if err != nil {
@@ -882,7 +902,11 @@ func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath strin
 	list := []string{}
 	for _, submodulePath := range submodulePaths {
 		for _, submoduleRemoteTrackingName := range submoduleOpts.submoduleRemoteTrackingNames {
+
+			submoduleRemoteTrackingName = removeQuotes(submoduleRemoteTrackingName)
+
 			submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+			
 			if err != nil {
 				return []string{}, err
 			}
@@ -999,6 +1023,7 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 	default:
 		// Not the first time. Figure out if the ref has changed.
 		local, remote, err := getRevs(ctx, target, branch, rev)
+
 		if err != nil {
 			return false, "", err
 		}

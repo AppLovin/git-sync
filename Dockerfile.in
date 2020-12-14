@@ -34,4 +34,5 @@ ADD bin/{ARG_OS}_{ARG_ARCH}/{ARG_BIN} /{ARG_BIN}
 
 WORKDIR /tmp
 USER 65533:65533
-ENTRYPOINT ["/{ARG_BIN}"]
+RUN echo ${ARG_BIN}
+ENTRYPOINT ["/{ARG_BIN}", "--submodules-remote-tracking='plugins'"]
