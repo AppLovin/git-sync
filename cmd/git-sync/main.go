@@ -875,17 +875,6 @@ func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string)
 	return "HEAD", nil
 }
 
-func removeQuotes(s string) string {
-	if len(s) > 0 && s[0] == '\'' {
-	    s = s[1:]
-	}
-	if len(s) > 0 && s[len(s)-1] == '\'' {
-	    s = s[:len(s)-1]
-	}
-	log.V(0).Info("returning trimmed string", s)
-	return s
-}
-
 func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions) ([]string, error) {
 	output, err := runCommand(ctx, worktreePath, *flGitCmd, "submodule", "--quiet", "foreach", "pwd")
 	if err != nil {
@@ -902,8 +891,6 @@ func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath strin
 	list := []string{}
 	for _, submodulePath := range submodulePaths {
 		for _, submoduleRemoteTrackingName := range submoduleOpts.submoduleRemoteTrackingNames {
-
-			submoduleRemoteTrackingName = removeQuotes(submoduleRemoteTrackingName)
 
 			submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
 			
